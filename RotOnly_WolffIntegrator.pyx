@@ -14,11 +14,12 @@ __docformat__ = 'restructuredtext'
 from cpython.pycapsule cimport PyCapsule_GetPointer, PyCapsule_New
 
 from libc.stdint cimport int32_t
+from libc.stdint cimport int64_t
 import numpy as N
 cimport numpy as N
 
 from MMTK import Units, ParticleProperties, Features, Environment, Vector
-from MMTK.Collections import Collections
+from MMTK.ForceFields.ForceField import CompoundForceField
 import MMTK.PIIntegratorSupport
 cimport MMTK.PIIntegratorSupport
 import numbers
@@ -201,11 +202,19 @@ cdef class RotOnlyWolff_PINormalModeIntegrator(MMTK.PIIntegratorSupport.PIIntegr
 
 ## Lori adds the potCalculator for energy interaction between the two particles
     def potCalculator(self, x, int Nmol, int Mol1, int Mol2, int totbeads, int nbeads):
+        cdef energy_data energytemp
         cdef double potResults
+        energytemp.gradients = NULL
+        energytemp.gradient_fn = NULL
+        energytemp.force_constants = NULL
+        energytemp.fc_fn = NULL
+        self.calculateEnergies(x, &energytemp, 0)
+        ## Sort Mol1 and Mol2, let Mol1 < Mol2
         if Mol1 > Mol2:
             t = Mol1
             Mol1 = Mol2
             Mol2 = t
+        ## Find the index of the interaction between Mol1 and Mol2
         offset = 0
         if Mol1 == 0:
             offset = 0
@@ -213,31 +222,39 @@ cdef class RotOnlyWolff_PINormalModeIntegrator(MMTK.PIIntegratorSupport.PIIntegr
             for i in range(0,Mol1):
                 offset += (Nmol-i-1)
         pot_index = (Mol2-Mol1-1+offset)*totbeads+nbeads
-        self.universe.energyTerms()
-        potResults = self.universe.energyEvaluator().CEvaluator().last_energy_values[pot_index]
+        #print "pot_index", Mol1, Mol2, pot_index
+        potResults = energytemp.energy_terms[pot_index]
         return potResults
 
-    def ClusterGrowth(self, x, m, beta, MCCosine, randVector, Nmol, Mol1, Mol2, totbeads, nbeads, bondlength):
+    def Reflect(self, MCCoord, RefVect):
+        cdef N.ndarray[double, ndim=1] RefMCCoord
+        RefMCCoord = MCCoord - 2.0*N.dot(MCCoord, RefVect)*RefVect
+        return RefMCCoord
+
+    def ClusterGrowth(self, xtemp, m, beta, MCCosine, randVector, Nmol, Mol1, Mol2, totbeads, nbeads, bondlength):
         cdef N.ndarray[double, ndim=1] reflectMol2
-        cdef N.ndarray[double, ndim=2] newcoords2
         cdef double pot_old, pot_new
         cdef double factor, linkProb
         cdef int link_active
-        pot_old = self.potCalculator(x,Nmol,Mol1,Mol2,totbeads,nbeads)
-        reflectMol2 = MCCosine[Mol1*totbeads+nbeads] - 2.0*N.dot(MCCosine[Mol1*totbeads+nbeads],randVector)*randVector
-        self.eulertocart(nbeads, Mol2, totbeads, x, m, reflectMol2, bondlength)
-        pot_new = self.potCalculator(x,Nmol,Mol1,Mol2,totbeads,nbeads)
+        ## When calculate the pot_old, the Mol1 has been reflected, and Mol2 hasn't
+        pot_old = self.potCalculator(xtemp,Nmol,Mol1,Mol2,totbeads,nbeads)
+        ## When calculte the pot_new, both Mol1 and Mol2 have been reflected
+        reflectMol2 = self.Reflect(MCCosine[Mol1*totbeads+nbeads], randVector)
+        self.eulertocart(nbeads, Mol2, totbeads, xtemp, m, reflectMol2, bondlength)
+        pot_new = self.potCalculator(xtemp,Nmol,Mol1,Mol2,totbeads,nbeads)
         factor = -(beta/totbeads)*(pot_new-pot_old)
         if factor < 0.0:
             linkProb = 1.0 - exp(factor)
         else:
             linkProb = 0.0
-        if linkProb > N.random.random: link_active = 1
+        if linkProb > N.random.random(): link_active = 1
+        #print "linkProb: ", linkProb
+        #print "link_active: ", link_active
         return link_active
 
 
     cdef start(self):
-        cdef double acceptratio, rd, sint, pot_old, pot_new, dens_old, dens_new, indexp0val, indexp1val
+        cdef double acceptratio, rd, sint, pot_old_a, pot_new_a, pot_old_c, pot_new_c, dens_old, dens_new, indexp0val, indexp1val
         cdef int t0b, t1b, t2b, t0, t1, t2, atombead, indexp0, indexp1, indexp0n, indexp1n
         cdef N.ndarray[double, ndim=2] x, v, g, dv, nmc, nmv, xcm, vcm, gcm
         cdef N.ndarray[double, ndim=1] m, mcm
@@ -252,22 +269,21 @@ cdef class RotOnlyWolff_PINormalModeIntegrator(MMTK.PIIntegratorSupport.PIIntegr
 
         cdef double propct, propphi
         cdef int P
-        cdef N.ndarray[double, ndim=1] costheta,phi
-        cdef N.ndarray[double, ndim=2] MCCosine
-        cdef N.ndarray[double, ndim=2] MCCosprop, newcoords
-        cdef N.ndarray[double, ndim=2] xold
+        cdef N.ndarray[double, ndim=1] costheta, phi
+        cdef N.ndarray[double, ndim=2] MCCosine, newcoords
+        cdef N.ndarray[double, ndim=1] MCCosprop
+        cdef N.ndarray[double, ndim=2] xtemp
         cdef N.ndarray[double, ndim=1] densitymatrix, rotenergy
         cdef double rotstep, ndens
         cdef int rotskipstep, nrotsteps
         cdef double randVcth, randVphi, randVsin
         cdef N.ndarray[double, ndim=1] randVector
-        cdef N.ndarray[N.int32_t, ndim=1] clu, buf, anticlu, linkclu
+        cdef N.ndarray[N.int64_t, ndim=1] clu, buf, anticlu, linkclu
         densitymatrix=self.densmat
         ndens=1.0*len(densitymatrix)
         rotenergy=self.rotengmat
         rotstep=self.rotmove
         rotskipstep=self.rotstepskip
-        xold=N.zeros((2,3),float)
 
         # Check if velocities have been initialized
         if self.universe.velocities() is None:
@@ -321,15 +337,15 @@ cdef class RotOnlyWolff_PINormalModeIntegrator(MMTK.PIIntegratorSupport.PIIntegr
         costheta = N.zeros(nbeads_mol, N.float)
         phi = N.zeros(nbeads_mol, N.float)
         MCCosine = N.zeros((nbeads_mol,3), N.float)
-        MCCosprop = N.zeros((nbeads_mol,3), N.float)
+        MCCosprop = N.zeros((3), N.float)
         newcoords = N.zeros((nbeads_mol,3), N.float)
         randVector = N.zeros(3, N.float)
 
         #CLUSTER VARIABLES
-        clu = N.array([],N.int32)
-        buf = N.array([],N.int32)
-        linkclu = N.array([],N.int32)
-        anticlu = N.array([],N.int32)
+        clu = N.array([],N.int64)
+        buf = N.array([],N.int64)
+        linkclu = N.array([],N.int64)
+        anticlu = N.array([],N.int64)
         ##########################################
         ### CALCULATE ANGLES AND FILL MCCosine ###
         ##########################################
@@ -337,8 +353,14 @@ cdef class RotOnlyWolff_PINormalModeIntegrator(MMTK.PIIntegratorSupport.PIIntegr
         for i in range(Nmol):
             bondlength[i]=(self.universe.atomList()[2*i+1].beadPositions()[0]-self.universe.atomList()[2*i].beadPositions()[0]).length()
 
+
         for k in range(Nmol):
             for i in range(P):
+                natomspmol=self.universe.objectList()[k].numberOfAtoms()
+                for j in range(natomspmol):
+                    xtemp=N.zeros((Nmol*natomspmol*P,3),float)
+                    for co in range(3):
+                        xtemp[(k*natomspmol+j)*P+i,co]=x[(k*natomspmol+j)*P+i,co]
                 rel=self.universe.atomList()[2*k+1].beadPositions()[i]-self.universe.atomList()[2*k].beadPositions()[i]
                 costheta[k*P+i]=N.dot(N.asarray(rel), N.asarray([0.,0.,1.]))/rel.length()
                 if (abs(rel[0])<1.0e-16):
@@ -438,7 +460,7 @@ cdef class RotOnlyWolff_PINormalModeIntegrator(MMTK.PIIntegratorSupport.PIIntegr
             #######################################
             ########## Wolff's Algorithm ##########
             #######################################
-
+            print "BEGIN WOLFF ROTATION"
             ## Check the rotskipstep (rotcorr)
             if (step%rotskipstep == 0):
                 nrotsteps+=1
@@ -449,8 +471,6 @@ cdef class RotOnlyWolff_PINormalModeIntegrator(MMTK.PIIntegratorSupport.PIIntegr
                     for t1b in range(stp%rotbdskip,P,rotbdskip):
                         atomcount=0
                         ## Create random vector for reflection
-                        #randVcth = rotstep*(N.random.random()-0.5)
-                        #randVphi = rotstep*(N.random.random()-0.5)
                         randVcth = N.random.random()*2.0-1.0 #random number from [-1.0,1.0)
                         randVphi = N.random.random()*(2.0*N.pi) #random number from [0,2PI)
                         ## Check the range of randVcth
@@ -464,18 +484,33 @@ cdef class RotOnlyWolff_PINormalModeIntegrator(MMTK.PIIntegratorSupport.PIIntegr
                         randVector[0] = randVsin*N.cos(randVphi)
                         randVector[1] = randVsin*N.sin(randVphi)
                         randVector[2] = randVcth
+                        #print "randVector: ", randVector
+                        #raise()
                         #########################################
                         ## Create empty cluster and buffer
                         randMol = N.random.random_integers(0,Nmol-1)
+                        #print "randMol: ", randMol
+                        #raise()
+                        #print "clu before: ", clu
+                        #print "buf before: ", buf
                         clu = N.append(clu,randMol)
-                        buf = N.append(clu,randMol)
+                        buf = N.append(buf,randMol)
+                        #print "clu begin: ", clu
+                        #print "buf begin: ", buf
+                        #raise()
                         ########################################
                         ## Reflect the first chosen random molecule based on the hyperplane orthogonal to randVector
-                        MCCosprop[randMol*P+t1b] = MCCosine[randMol*P+t1b] - 2*N.dot(randVector,MCCosine[randMol*P+t1b])*randVector
+                        MCCosprop = self.Reflect(MCCosine[randMol*P+t1b], randVector)
+                        ## Save the reflected MCCosine in newcoords for Mol1
+                        newcoords[randMol*P+t1b] = MCCosprop
+                        ## Temperoraily change the randMol Cartesian coordinates based on the newcoords
+                        self.eulertocart(t1b, randMol, P, xtemp, m, MCCosprop, bondlength)
                         ########################################
                         ## Grow the cluster
                         while True:
+                            ## Save the first Mol in buffer to Mol0
                             Mol0 = buf[0]
+                            ## pop off the first Mol in buffer
                             buf = N.delete(buf,0)
                             ## join the nearest neighbor (nnMol) to the linkclu
                             for nnMol in range(Mol0-1, Mol0+2, 2):
@@ -488,14 +523,25 @@ cdef class RotOnlyWolff_PINormalModeIntegrator(MMTK.PIIntegratorSupport.PIIntegr
                                         else: Attempt = True
                                     ## pop the random site i off the buffer
                                     if Attempt:
-                                        link_active = self.ClusterGrowth(x, m, beta, MCCosine, randVector, Nmol, Mol0, nnMol, P, t1b, bondlength)
+                                        ## We need a xtemp to keep the x unchanged in cluster growth part
+                                        link_active = self.ClusterGrowth(xtemp, m, beta, MCCosine, randVector, Nmol, Mol0, nnMol, P, t1b, bondlength)
+                                        ## Change the xtemp back to the original configuration for both Mol0 and nnMol
+                                        for a in range(natomspmol):
+                                            natomspmol=self.universe.objectList()[a].numberOfAtoms()
+                                            for co in range(3):
+                                                xtemp[(Mol0*natomspmol+a)*P+t1b,co] = x[(Mol0*natomspmol+a)*P+t1b,co]
+                                                xtemp[(nnMol*natomspmol+a)*P+t1b,co] = x[(nnMol*natomspmol+a)*P+t1b,co]
                                         if link_active == 1:
-                                            ## if linked, reflect the nnMol based on the random vector
+                                            ## if linked, reflect the nnMol based on the random vector, and save in newcoords
                                             newcoords[nnMol*P+t1b] = MCCosine[nnMol*P+t1b] - 2*N.dot(randVector,MCCosine[nnMol*P+t1b])*randVector
+                                            ## if linked, add this nnMol to both cluster and buffer
                                             clu = N.append(clu,nnMol)
                                             buf = N.append(buf,nnMol)
+                                            #print "clu: ", clu
+                                            #print "buf: ", buf
                             if (buf.size != 0):
                                 break
+
                         ########################################
                         ## Create the array of Rotors
 
@@ -556,8 +602,8 @@ cdef class RotOnlyWolff_PINormalModeIntegrator(MMTK.PIIntegratorSupport.PIIntegr
                             p0=0.0
                             p1=0.0
                             for co in range(3):
-                                p0+=MCCosine[t0][co]*MCCosprop[co]
-                                p1+=MCCosprop[co]*MCCosine[t2][co]
+                                p0+=MCCosine[t0][co]*newcoords[t1][co]
+                                p1+=newcoords[t1][co]*MCCosine[t2][co]
 
                             indexp0=int(N.floor((p0+1.0)*(ndens-1.0)/2.0))
                             indexp1=int(N.floor((p1+1.0)*(ndens-1.0)/2.0))
@@ -581,16 +627,16 @@ cdef class RotOnlyWolff_PINormalModeIntegrator(MMTK.PIIntegratorSupport.PIIntegr
                                 raise()
                             #####################################
                             ## Compute potential interaction not in the cluster
-                            if len(anticlu) == 0:
-                                break
-                            else:
+                            if len(anticlu) != 0:
                                 for anticlu_i in range(len(anticlu)):
                                     ## Calculate the potential interaction between i and j>i+1
                                     if N.abs(anticlu[anticlu_i] - clu[clu_i]) >= 2: 
                                         ## Loop over anticluster
-                                        pot_old_a += self.potCalculator(N.asarray(xold), Nmol, clu[clu_i], anticlu[anticlu_i], P, t1)
-                                        self.eulertocart(t1b, clu[clu_i], P, x, m, MCCosprop, bondlength)
-                                        pot_new_a += self.potCalculator(N.asarray(x), Nmol, clu[clu_i], anticlu[anticlu_i+1], P, t1)
+                                        pot_old_a += self.potCalculator(N.asarray(x), Nmol, clu[clu_i], anticlu[anticlu_i], P, t1b)
+                                        #print "pot_old_a: ", pot_old_a
+                                        self.eulertocart(t1b, clu[clu_i], P, x, m, newcoords[clu[clu_i]*P+t1b], bondlength)
+                                        pot_new_a += self.potCalculator(N.asarray(x), Nmol, clu[clu_i], anticlu[anticlu_i], P, t1b)
+                                        #print "pot_new_a: ", pot_new_a
                                 ## Loop over cluster
                                 pot_old_c += pot_old_a
                                 pot_new_c += pot_old_a
@@ -606,18 +652,20 @@ cdef class RotOnlyWolff_PINormalModeIntegrator(MMTK.PIIntegratorSupport.PIIntegr
                             accept=True
                         elif (rd>N.random.random()):
                             accept=True
-                    
+
                         if (accept):
                             pot_old_c=pot_new_c
                             acceptratio+=1.0
                             for clu_i in range(len(clu)):
                                 for co in range(3):
-                                    MCCosine[t1][co]=MCCosprop[co]
+                                    MCCosine[clu_i*P+t1b][co]=newcoords[clu_i*P+t1b][co]
                         else:
-                            for i in range(natomspmol):
-                                for j in range(3):
-                                    x[atombead+i*P,j]=xold[i,j]
-                        clu = N.array([],N.int32)
+                            for clu_i in range(len(clu)):
+                                for i in range(natomspmol):
+                                    for j in range(3):
+                                        x_index = (clu[clu_i]*natomspmol+i)*P+t1b
+                                        x[x_index,j]=xtemp[x_index,j]
+                        clu = N.array([],N.int64)
 
             qe_prim=self.energyCalculator(N.asarray(x))
             qe_rot=0.0
